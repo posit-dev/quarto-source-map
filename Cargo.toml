@@ -1,0 +1,20 @@
+[package]
+name = "quarto-source-map"
+version = "0.1.0"
+edition = "2024"
+authors = ["Posit Software, PBC"]
+license = "MIT"
+description = "Source-location tracking with byte-range provenance, for parsers and diagnostics."
+repository = "https://github.com/posit-dev/quarto-source-map"
+homepage = "https://github.com/posit-dev/quarto-source-map"
+readme = "README.md"
+keywords = ["source-map", "spans", "diagnostics", "parser", "provenance"]
+categories = ["development-tools", "parsing"]
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive", "rc"] }
+serde_json = "1.0.149"
+smallvec = { version = "1.13", features = ["serde"] }
+
+[dev-dependencies]
+serde_json = "1.0.149"
