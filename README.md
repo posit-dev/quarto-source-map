@@ -1,5 +1,7 @@
 # quarto-source-map
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/posit-dev/quarto-source-map)
+
 Unified source-location tracking with byte-range provenance, for parsers and
 diagnostics.
 
