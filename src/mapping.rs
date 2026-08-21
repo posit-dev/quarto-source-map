@@ -68,7 +68,7 @@ impl SourceInfo {
                 if let Some(last) = pieces.last()
                     && offset == last.offset_in_concat + last.length
                 {
-                    return last.source_info.map_offset(last.length, ctx);
+                    return last.source_info.map_offset(last.source_info.length(), ctx);
                 }
                 None // Offset not found in any piece
             }
@@ -231,6 +231,143 @@ mod tests {
         assert_eq!(start.location.offset, 0);
         assert_eq!(end.file_id, file_id2);
         assert_eq!(end.location.offset, 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // Concat's exclusive-end branch: last piece's *source* length, not its
+    // *content* length. Three measured terminal shapes (see
+    // extract-design-concat-preimage.md, "SourceInfo::Concat is already the
+    // right shape").
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_map_offset_concat_exclusive_end_all_verbatim_is_gating() {
+        // GATING: this assertion is unchanged by the fix (Some(9) both
+        // before and after) — for a verbatim last piece, content length
+        // equals source length, so `last.length` and
+        // `last.source_info.length()` agree. Keep for shape; do not cite
+        // as coverage for the mapping.rs:64-70 fix.
+        let mut ctx = SourceContext::new();
+        let file_id = ctx.add_file("test.qmd".to_string(), Some("hello world".to_string()));
+
+        let first = SourceInfo::from_range(
+            file_id,
+            Range {
+                start: Location {
+                    offset: 0,
+                    row: 0,
+                    column: 0,
+                },
+                end: Location {
+                    offset: 4,
+                    row: 0,
+                    column: 4,
+                },
+            },
+        );
+        let last = SourceInfo::from_range(
+            file_id,
+            Range {
+                start: Location {
+                    offset: 4,
+                    row: 0,
+                    column: 4,
+                },
+                end: Location {
+                    offset: 9,
+                    row: 0,
+                    column: 9,
+                },
+            },
+        );
+        let concat = SourceInfo::concat(vec![(first, 4), (last, 5)]);
+
+        // offset 9 == total content length -> exclusive-end branch
+        let mapped = concat.map_offset(9, &ctx).unwrap();
+        assert_eq!(mapped.location.offset, 9);
+    }
+
+    #[test]
+    fn test_map_offset_concat_exclusive_end_replacement_terminated() {
+        // A last piece whose content is a decoded replacement (`''` -> `'`):
+        // source span 7..9 (2 bytes) collapses to 1 content byte. Before the
+        // fix, `last.length` (content length 1) reaches only source offset
+        // 8; after the fix, `last.source_info.length()` (source length 2)
+        // reaches the true source end, 9.
+        let mut ctx = SourceContext::new();
+        let file_id = ctx.add_file("test.qmd".to_string(), Some("012345678".to_string()));
+
+        let first = SourceInfo::from_range(
+            file_id,
+            Range {
+                start: Location {
+                    offset: 0,
+                    row: 0,
+                    column: 0,
+                },
+                end: Location {
+                    offset: 7,
+                    row: 0,
+                    column: 7,
+                },
+            },
+        );
+        let replacement = SourceInfo::from_range(
+            file_id,
+            Range {
+                start: Location {
+                    offset: 7,
+                    row: 0,
+                    column: 7,
+                },
+                end: Location {
+                    offset: 9,
+                    row: 0,
+                    column: 9,
+                },
+            },
+        );
+        // first piece: 7 content bytes over 7 source bytes (verbatim);
+        // replacement piece: 1 content byte over 2 source bytes.
+        let concat = SourceInfo::concat(vec![(first, 7), (replacement, 1)]);
+
+        // offset 8 == total content length (7 + 1) -> exclusive-end branch
+        let mapped = concat.map_offset(8, &ctx).unwrap();
+        assert_eq!(mapped.location.offset, 9);
+    }
+
+    #[test]
+    fn test_map_offset_concat_exclusive_end_synthesis_terminated() {
+        // A last piece synthesized at EOF: `Original{eof, eof}` (zero-width
+        // source span) with a 1-byte content length. Before the fix,
+        // `last.length` (1) pushes the absolute offset to eof + 1, which
+        // exceeds the file's total length and returns None — a
+        // clip-chomped block scalar at EOF loses its caret's right edge
+        // entirely. After the fix, `last.source_info.length()` (0) maps to
+        // exactly eof, which is in bounds.
+        let mut ctx = SourceContext::new();
+        let file_id = ctx.add_file("test.qmd".to_string(), Some("hello world".to_string())); // 11 bytes
+
+        let synthesis = SourceInfo::from_range(
+            file_id,
+            Range {
+                start: Location {
+                    offset: 11,
+                    row: 0,
+                    column: 11,
+                },
+                end: Location {
+                    offset: 11,
+                    row: 0,
+                    column: 11,
+                },
+            },
+        );
+        let concat = SourceInfo::concat(vec![(synthesis, 1)]);
+
+        // offset 1 == total content length -> exclusive-end branch
+        let mapped = concat.map_offset(1, &ctx).unwrap();
+        assert_eq!(mapped.location.offset, 11);
     }
 
     #[test]

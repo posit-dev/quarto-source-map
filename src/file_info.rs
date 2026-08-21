@@ -120,7 +120,7 @@ impl FileInformation {
         let column = content[line_start..safe_offset].chars().count();
 
         Some(Location {
-            offset,
+            offset: safe_offset,
             row,
             column,
         })
@@ -342,5 +342,23 @@ mod tests {
         let loc = info.offset_to_location(4, content).unwrap();
         assert_eq!(loc.row, 0);
         assert_eq!(loc.column, 2);
+    }
+
+    #[test]
+    fn test_offset_to_location_floors_offset_field_too() {
+        // `x = 'A✨B'` — ✨ (U+2728) occupies bytes 6..9. A mid-character
+        // offset (7) must floor *both* the column (already floored) and the
+        // returned `offset` field to the same char boundary (6), so the
+        // `Location` describes one consistent position instead of pairing a
+        // sanitized column with a raw, out-of-bounds-relative offset.
+        let content = "x = 'A✨B'";
+        let info = FileInformation::new(content);
+
+        let loc = info.offset_to_location(7, content).unwrap();
+        assert_eq!(
+            loc.offset, 6,
+            "offset should be floored to the char boundary, like column"
+        );
+        assert_eq!(loc.column, 6);
     }
 }

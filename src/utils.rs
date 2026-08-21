@@ -13,9 +13,23 @@ pub fn offset_to_location(source: &str, offset: usize) -> Option<Location> {
     let mut row = 0;
     let mut column = 0;
     let mut current_offset = 0;
+    // Floors to the start of the char containing `offset` when `offset`
+    // lands mid-character; equal to `offset` for boundary offsets. Kept in
+    // sync with FileInformation::offset_to_location's floor.
+    let mut safe_offset = offset;
 
     for ch in source.chars() {
         if current_offset >= offset {
+            break;
+        }
+
+        let char_len = ch.len_utf8();
+        if offset < current_offset + char_len {
+            // `offset` lands inside this character. Floor to its start and
+            // stop the column loop before counting it — otherwise the
+            // column would overcount by one relative to FileInformation,
+            // which floors before counting.
+            safe_offset = current_offset;
             break;
         }
 
@@ -26,11 +40,11 @@ pub fn offset_to_location(source: &str, offset: usize) -> Option<Location> {
             column += 1;
         }
 
-        current_offset += ch.len_utf8();
+        current_offset += char_len;
     }
 
     Some(Location {
-        offset,
+        offset: safe_offset,
         row,
         column,
     })
@@ -207,5 +221,22 @@ mod tests {
         let loc = offset_to_location(source, 12).unwrap();
         assert_eq!(loc.row, 2);
         assert_eq!(loc.column, 0);
+    }
+
+    #[test]
+    fn test_offset_to_location_agrees_with_file_information_on_mid_char_offset() {
+        // Same fixture as FileInformation::offset_to_location's regression
+        // test: "x = 'A✨B'", where ✨ (U+2728) occupies bytes 6..9. A
+        // mid-character offset (7) must floor to the char boundary (6) —
+        // both the returned offset and the column — so this free function
+        // agrees with FileInformation's, instead of overcounting the column
+        // by one because it only breaks the loop once current_offset >=
+        // offset, by which point the containing character has already been
+        // counted.
+        let source = "x = 'A✨B'";
+        let loc = offset_to_location(source, 7).unwrap();
+        assert_eq!(loc.offset, 6);
+        assert_eq!(loc.row, 0);
+        assert_eq!(loc.column, 6);
     }
 }

@@ -409,15 +409,31 @@ impl SourceInfo {
 
     /// Byte range in `target` that this `SourceInfo`'s preimage covers, if any.
     ///
-    /// This is the writer's "can I Verbatim-copy bytes from `target` for the
-    /// node carrying this source_info?" check.
+    /// A `Some(hull)` licenses **locating** a position in `target` — it does
+    /// not license **copying** bytes from it. For an `Original` or a
+    /// `Substring` chain that bottoms out in one, the hull happens to be
+    /// byte-identical to this node's content, so locating and copying
+    /// coincide. For a `Concat`, the hull is an **offset claim only**: a
+    /// piece's source run and its content run can have equal length and
+    /// different bytes (a 1→1 fold, e.g. a decoded escape that happens to
+    /// decode to the same length it was encoded in) — no length or
+    /// contiguity check can detect this, and `SourceInfo` carries no
+    /// verbatim/replacement tag once constructed. A caller that needs to
+    /// copy bytes (the writer's "can I Verbatim-copy for this node"
+    /// decision) needs byte-identity, which this function cannot supply for
+    /// a `Concat`; it can only supply it for `Original`/`Substring`.
     ///
     /// Semantics by variant:
     /// - `Original` → `Some(start..end)` iff the file matches `target`, else `None`.
-    /// - `Substring` → recurse the parent; offsets compose additively.
+    /// - `Substring` → if the parent is a `Concat`, `None` — see above; the
+    ///   affine composition `parent_range.start + offset` is only valid when
+    ///   the parent is byte-identical to its content, which a `Concat`
+    ///   parent is not. Otherwise, recurse the parent; offsets compose
+    ///   additively.
     /// - `Concat` → every piece must resolve into `target` AND the resolved
     ///   ranges must be byte-contiguous (no gaps, no overlaps). A gappy Concat
-    ///   returns `None` — the writer can't Verbatim-copy a non-contiguous span.
+    ///   returns `None`. The resulting hull is an offset claim, not a
+    ///   byte-identity claim (see above).
     /// - `Generated` → walk the `Invocation` anchor only via
     ///   [`invocation_anchor`](Self::invocation_anchor). **No other anchor
     ///   role is consulted** — not `ValueSource` (Plan 9), not future
@@ -445,6 +461,18 @@ impl SourceInfo {
                 end_offset,
             } if *file_id == target => Some(*start_offset..*end_offset),
             SourceInfo::Original { .. } => None,
+            SourceInfo::Substring { parent, .. }
+                if matches!(**parent, SourceInfo::Concat { .. }) =>
+            {
+                // A Concat parent is not byte-identical to its content (a
+                // piece's source run and content run can differ in length
+                // and bytes — the 1→1 fold), so composing this Substring's
+                // offsets affinely over the parent's hull would produce a
+                // wrong-but-plausible-looking range. Refuse instead: this
+                // matches resolve_byte_range's Concat arm, which also
+                // returns None rather than guess.
+                None
+            }
             SourceInfo::Substring {
                 parent,
                 start_offset,
@@ -1945,6 +1973,100 @@ mod tests {
         let b = SourceInfo::original(FileId(1), 15, 25);
         let info = SourceInfo::concat(vec![(a, 5), (b, 10)]);
         assert_eq!(info.preimage_in(FileId(0)), None);
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 1 (quarto-source-map 0.1.2) — preimage_in must not compose
+    // affinely over a Concat parent through the Substring arm.
+    // See extract-design-concat-preimage.md, "preimage_in composes
+    // affinely over a Concat parent, and must not".
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_preimage_in_substring_over_concat_parent_returns_none() {
+        // Gap-free Concat modelling YAML 'it''s': verbatim "it" (source
+        // 1..3), a collapsed-escape replacement "'" (source 3..5, 1
+        // content byte), verbatim "s" (source 5..6). Content is 4 bytes;
+        // source extent 1..6.
+        let it = SourceInfo::original(FileId(0), 1, 3);
+        let escaped_quote = SourceInfo::original(FileId(0), 3, 5);
+        let s = SourceInfo::original(FileId(0), 5, 6);
+        let concat = SourceInfo::concat(vec![(it, 2), (escaped_quote, 1), (s, 1)]);
+
+        // Substring{parent: Concat} composes affinely before the fix and
+        // returns the wrong hull Some(1..5) — under by exactly the
+        // collapsed escape byte. After the fix it must return None.
+        let sub = SourceInfo::substring(concat, 0, 4);
+        assert_eq!(sub.preimage_in(FileId(0)), None);
+    }
+
+    #[test]
+    fn test_preimage_in_bare_concat_over_gap_free_pieces_is_gating() {
+        // GATING: same 'it''s' fixture as above, queried directly on the
+        // Concat (no Substring). Unchanged by the fix — pins that only the
+        // Substring composition changed, not the Concat arm itself.
+        let it = SourceInfo::original(FileId(0), 1, 3);
+        let escaped_quote = SourceInfo::original(FileId(0), 3, 5);
+        let s = SourceInfo::original(FileId(0), 5, 6);
+        let concat = SourceInfo::concat(vec![(it, 2), (escaped_quote, 1), (s, 1)]);
+
+        assert_eq!(concat.preimage_in(FileId(0)), Some(1..6));
+    }
+
+    #[test]
+    fn test_preimage_in_cell_options_multi_option_shape_is_gating() {
+        // GATING: hand-modelled Concat for a multi-option cell. Each
+        // option line's piece excludes the `#| ` prefix, so consecutive
+        // option lines leave a source gap where the next prefix sits.
+        // Already None both bare and through Substring, before and after
+        // the fix — gappy Concats always refuse.
+        let opt_a = SourceInfo::original(FileId(0), 3, 4);
+        let opt_b = SourceInfo::original(FileId(0), 10, 11);
+        let concat = SourceInfo::concat(vec![(opt_a, 1), (opt_b, 1)]);
+
+        assert_eq!(concat.preimage_in(FileId(0)), None);
+        let sub = SourceInfo::substring(concat, 0, 2);
+        assert_eq!(sub.preimage_in(FileId(0)), None);
+    }
+
+    #[test]
+    fn test_preimage_in_cell_options_single_option_shape_through_substring_returns_none() {
+        // Hand-modelled Concat for a single-option cell: one gap-free
+        // piece (no prefix-induced gap). The bare Concat still yields a
+        // correct affine hull — untouched by this fix, since a single
+        // piece is trivially contiguous. Only the Substring composition
+        // changes: before the fix it returns the same Some hull; after
+        // the fix it must return None, since the parent is a Concat. This
+        // is the one row that binds the documented behavior change.
+        let opt = SourceInfo::original(FileId(0), 5, 8);
+        let concat = SourceInfo::concat(vec![(opt, 3)]);
+
+        assert_eq!(concat.preimage_in(FileId(0)), Some(5..8));
+
+        let sub = SourceInfo::substring(concat, 0, 3);
+        assert_eq!(sub.preimage_in(FileId(0)), None);
+    }
+
+    #[test]
+    fn test_preimage_in_concat_contiguous_hull_with_zero_content_piece() {
+        // Escaped-break shape: verbatim 4..7, a stored zero-content piece
+        // 7..11 (the collapsed escape bytes contribute no decoded content
+        // but must stay in the source tiling so it remains gap-free), and
+        // verbatim 11..14. Guards against a future "simplification" that
+        // special-cases zero-content pieces and drops them from the
+        // contiguity walk.
+        let a = SourceInfo::original(FileId(0), 4, 7);
+        let zero_content = SourceInfo::original(FileId(0), 7, 11);
+        let b = SourceInfo::original(FileId(0), 11, 14);
+        let concat = SourceInfo::concat(vec![(a, 3), (zero_content, 0), (b, 3)]);
+        assert_eq!(concat.preimage_in(FileId(0)), Some(4..14));
+
+        // Omitting the zero-content piece leaves a source gap (7..11
+        // missing) between the two verbatim pieces -> None.
+        let a2 = SourceInfo::original(FileId(0), 4, 7);
+        let b2 = SourceInfo::original(FileId(0), 11, 14);
+        let concat_missing_piece = SourceInfo::concat(vec![(a2, 3), (b2, 3)]);
+        assert_eq!(concat_missing_piece.preimage_in(FileId(0)), None);
     }
 
     #[test]
