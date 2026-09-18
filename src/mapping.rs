@@ -2,6 +2,7 @@
 
 use crate::types::{FileId, Location};
 use crate::{SourceContext, SourceInfo};
+use std::borrow::Cow;
 
 /// Result of mapping a position back to an original file
 #[derive(Debug, Clone, PartialEq)]
@@ -28,10 +29,14 @@ impl SourceInfo {
                 // Compute the absolute offset in the file
                 let absolute_offset = start_offset + offset;
 
-                // Get file content: use stored content for ephemeral files, or read from disk
-                let content = match &file.content {
-                    Some(c) => c.clone(),
-                    None => std::fs::read_to_string(&file.path).ok()?,
+                // Get file content: borrow the stored content for ephemeral
+                // files, or read from disk. `offset_to_location` only needs a
+                // `&str`, so the in-memory case must not clone — callers map
+                // one offset per AST node, and a clone here made that
+                // O(nodes × file size) (quarto-dev/q2 bd-jn7r22g8).
+                let content: Cow<'_, str> = match &file.content {
+                    Some(c) => Cow::Borrowed(c.as_str()),
+                    None => Cow::Owned(std::fs::read_to_string(&file.path).ok()?),
                 };
 
                 // Convert offset to Location with row/column using efficient binary search
@@ -132,6 +137,33 @@ mod tests {
         assert_eq!(mapped.location.offset, 6);
         assert_eq!(mapped.location.row, 1);
         assert_eq!(mapped.location.column, 0);
+    }
+
+    #[test]
+    fn test_map_offset_disk_backed_file() {
+        // `content: None` files are read from disk on demand (the `Owned`
+        // arm); they must resolve exactly like in-memory files.
+        let dir = std::env::temp_dir().join(format!(
+            "quarto-source-map-map-offset-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("disk.qmd");
+        std::fs::write(&path, "hello\nwörld\n").unwrap();
+
+        let mut ctx = SourceContext::new();
+        let file_id = ctx.add_file(path.to_string_lossy().into_owned(), None);
+        assert!(ctx.get_file(file_id).unwrap().content.is_none());
+
+        let info = SourceInfo::original(file_id, 0, 13);
+        // offset 9 is the 'r' after the two-byte 'ö': row 1, column 2 (chars)
+        let mapped = info.map_offset(9, &ctx).unwrap();
+        assert_eq!(mapped.file_id, file_id);
+        assert_eq!(mapped.location.offset, 9);
+        assert_eq!(mapped.location.row, 1);
+        assert_eq!(mapped.location.column, 2);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
