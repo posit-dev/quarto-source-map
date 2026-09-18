@@ -61,18 +61,20 @@ impl SourceContext {
 
         // For ephemeral files (content provided), store it and create FileInformation
         // For disk-backed files (no content), try to read from disk for FileInformation only
-        let (stored_content, content_for_info) = match content {
+        let (stored_content, file_info) = match content {
             Some(c) => {
-                // Ephemeral file: store content and use it for FileInformation
-                (Some(c.clone()), Some(c))
+                // Ephemeral file: index the content, then store it (no clone)
+                let info = FileInformation::new(&c);
+                (Some(c), Some(info))
             }
             None => {
                 // Disk-backed file: don't store content, but try to read for FileInformation
-                (None, std::fs::read_to_string(&path).ok())
+                let info = std::fs::read_to_string(&path)
+                    .ok()
+                    .map(|c| FileInformation::new(&c));
+                (None, info)
             }
         };
-
-        let file_info = content_for_info.as_ref().map(|c| FileInformation::new(c));
         self.files.push(SourceFile {
             path,
             content: stored_content,
@@ -121,12 +123,18 @@ impl SourceContext {
         }
 
         // Process content same as add_file
-        let (stored_content, content_for_info) = match content {
-            Some(c) => (Some(c.clone()), Some(c)),
-            None => (None, std::fs::read_to_string(&path).ok()),
+        let (stored_content, file_info) = match content {
+            Some(c) => {
+                let info = FileInformation::new(&c);
+                (Some(c), Some(info))
+            }
+            None => {
+                let info = std::fs::read_to_string(&path)
+                    .ok()
+                    .map(|c| FileInformation::new(&c));
+                (None, info)
+            }
         };
-
-        let file_info = content_for_info.as_ref().map(|c| FileInformation::new(c));
 
         // Add to files vec and create mapping
         let index = self.files.len();
