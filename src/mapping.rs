@@ -77,7 +77,7 @@ impl SourceInfo {
                 }
                 None // Offset not found in any piece
             }
-            SourceInfo::Generated { .. } => {
+            SourceInfo::Generated(..) => {
                 // Generated nodes have no offset-within-current-text;
                 // callers wanting source coordinates use resolve_byte_range.
                 None

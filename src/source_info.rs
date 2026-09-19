@@ -47,17 +47,31 @@ pub enum SourceInfo {
     Concat { pieces: Vec<SourcePiece> },
     /// Node produced by a pipeline transform
     ///
-    /// `by` records the producer ("which transform made me"); `from` is a
-    /// list of typed, role-labeled source-info pointers ("which source
-    /// bytes contributed to me"). Empty `from` means pure synthesis
-    /// (sectionize wrappers, filter constructions, title-block h1).
-    /// An `Invocation` anchor present means there is a source-side
-    /// preimage (every shortcode resolution).
-    Generated {
-        by: By,
-        #[serde(default, skip_serializing_if = "SmallVec::is_empty")]
-        from: SmallVec<[Anchor; 2]>,
-    },
+    /// The payload lives in [`Generated`] behind a `Box` so that the three
+    /// common variants don't pay for it: every downstream AST node carries at
+    /// least one `SourceInfo`, and with the payload inline this enum was
+    /// 136 bytes instead of 32. Construct with [`SourceInfo::generated`] /
+    /// [`SourceInfo::generated_with`]; inspect with
+    /// [`SourceInfo::as_generated`] or by matching `SourceInfo::Generated(g)`.
+    ///
+    /// The JSON encoding is unchanged from the unboxed layout:
+    /// `{"Generated": {"by": …, "from": […]}}`.
+    Generated(Box<Generated>),
+}
+
+/// Payload of a [`SourceInfo::Generated`] node.
+///
+/// `by` records the producer ("which transform made me"); `from` is a
+/// list of typed, role-labeled source-info pointers ("which source
+/// bytes contributed to me"). Empty `from` means pure synthesis
+/// (sectionize wrappers, filter constructions, title-block h1).
+/// An `Invocation` anchor present means there is a source-side
+/// preimage (every shortcode resolution).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Generated {
+    pub by: By,
+    #[serde(default, skip_serializing_if = "SmallVec::is_empty")]
+    pub from: SmallVec<[Anchor; 2]>,
 }
 
 /// Producer identity for a [`SourceInfo::Generated`] node.
@@ -228,13 +242,37 @@ impl SourceInfo {
 
     /// Create a [`SourceInfo::Generated`] with an empty anchor list.
     ///
-    /// Use [`SourceInfo::append_anchor`] to add anchors after construction.
-    /// For Generated nodes that need to carry anchors at construction
-    /// time, build the variant directly: `SourceInfo::Generated { by, from }`.
+    /// Use [`SourceInfo::append_anchor`] to add anchors after construction,
+    /// or [`SourceInfo::generated_with`] to supply them up front.
     pub fn generated(by: By) -> Self {
-        SourceInfo::Generated {
+        Self::generated_with(by, SmallVec::new())
+    }
+
+    /// Create a [`SourceInfo::Generated`] carrying `from` as its anchor list.
+    ///
+    /// Accepts anything that converts into the anchor `SmallVec`, such as a
+    /// `smallvec![..]` or a `Vec<Anchor>`.
+    pub fn generated_with(by: By, from: impl Into<SmallVec<[Anchor; 2]>>) -> Self {
+        SourceInfo::Generated(Box::new(Generated {
             by,
-            from: SmallVec::new(),
+            from: from.into(),
+        }))
+    }
+
+    /// The [`Generated`] payload, if this is a [`SourceInfo::Generated`].
+    pub fn as_generated(&self) -> Option<&Generated> {
+        match self {
+            SourceInfo::Generated(g) => Some(g),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the [`Generated`] payload, if this is a
+    /// [`SourceInfo::Generated`].
+    pub fn as_generated_mut(&mut self) -> Option<&mut Generated> {
+        match self {
+            SourceInfo::Generated(g) => Some(g),
+            _ => None,
         }
     }
 
@@ -244,10 +282,7 @@ impl SourceInfo {
     /// provenance to record. Replaces the historical
     /// `SourceInfo::default()` pattern in tests.
     pub fn for_test() -> Self {
-        SourceInfo::Generated {
-            by: By::test_scaffold(),
-            from: SmallVec::new(),
-        }
+        Self::generated(By::test_scaffold())
     }
 
     /// If this is a [`SourceInfo::Generated`], return the first anchor whose
@@ -257,7 +292,8 @@ impl SourceInfo {
     /// By convention there is at most one `Invocation` anchor per node.
     pub fn invocation_anchor(&self) -> Option<&Arc<SourceInfo>> {
         match self {
-            SourceInfo::Generated { from, .. } => from
+            SourceInfo::Generated(g) => g
+                .from
                 .iter()
                 .find(|a| matches!(a.role, AnchorRole::Invocation))
                 .map(|a| &a.source_info),
@@ -272,7 +308,8 @@ impl SourceInfo {
     /// `ValueSource` anchor per node.
     pub fn value_source_anchor(&self) -> Option<&Arc<SourceInfo>> {
         match self {
-            SourceInfo::Generated { from, .. } => from
+            SourceInfo::Generated(g) => g
+                .from
                 .iter()
                 .find(|a| matches!(a.role, AnchorRole::ValueSource))
                 .map(|a| &a.source_info),
@@ -290,8 +327,9 @@ impl SourceInfo {
         role: &'a AnchorRole,
     ) -> Box<dyn Iterator<Item = &'a Arc<SourceInfo>> + 'a> {
         match self {
-            SourceInfo::Generated { from, .. } => Box::new(
-                from.iter()
+            SourceInfo::Generated(g) => Box::new(
+                g.from
+                    .iter()
                     .filter(move |a| &a.role == role)
                     .map(|a| &a.source_info),
             ),
@@ -308,9 +346,7 @@ impl SourceInfo {
     /// role return the earliest match.
     pub fn append_anchor(&mut self, role: AnchorRole, source_info: Arc<SourceInfo>) {
         match self {
-            SourceInfo::Generated { from, .. } => {
-                from.push(Anchor { role, source_info });
-            }
+            SourceInfo::Generated(g) => g.from.push(Anchor { role, source_info }),
             _ => panic!("append_anchor called on non-Generated SourceInfo"),
         }
     }
@@ -343,7 +379,7 @@ impl SourceInfo {
                 ..
             } => end_offset - start_offset,
             SourceInfo::Concat { pieces } => pieces.iter().map(|p| p.length).sum(),
-            SourceInfo::Generated { .. } => 0,
+            SourceInfo::Generated(..) => 0,
         }
     }
 
@@ -357,7 +393,7 @@ impl SourceInfo {
             SourceInfo::Original { start_offset, .. } => *start_offset,
             SourceInfo::Substring { start_offset, .. } => *start_offset,
             SourceInfo::Concat { .. } => 0,
-            SourceInfo::Generated { .. } => 0,
+            SourceInfo::Generated(..) => 0,
         }
     }
 
@@ -371,7 +407,7 @@ impl SourceInfo {
             SourceInfo::Original { end_offset, .. } => *end_offset,
             SourceInfo::Substring { end_offset, .. } => *end_offset,
             SourceInfo::Concat { .. } => self.length(),
-            SourceInfo::Generated { .. } => 0,
+            SourceInfo::Generated(..) => 0,
         }
     }
 
@@ -401,7 +437,7 @@ impl SourceInfo {
                 Some((fid, parent_start + start_offset, parent_start + end_offset))
             }
             SourceInfo::Concat { .. } => None,
-            SourceInfo::Generated { .. } => self
+            SourceInfo::Generated(..) => self
                 .invocation_anchor()
                 .and_then(|si| si.resolve_byte_range()),
         }
@@ -497,7 +533,7 @@ impl SourceInfo {
                     None
                 }
             }
-            SourceInfo::Generated { .. } => self
+            SourceInfo::Generated(..) => self
                 .invocation_anchor()
                 .and_then(|si| si.preimage_in(target)),
         }
@@ -528,8 +564,8 @@ impl SourceInfo {
                     piece.source_info.remap_file_ids(map);
                 }
             }
-            SourceInfo::Generated { from, .. } => {
-                for anchor in from {
+            SourceInfo::Generated(g) => {
+                for anchor in g.from.iter_mut() {
                     // Arc::make_mut clones if there are other references.
                     let inner = Arc::make_mut(&mut anchor.source_info);
                     inner.remap_file_ids(map);
@@ -553,9 +589,7 @@ impl SourceInfo {
             SourceInfo::Concat { pieces } => {
                 pieces.iter().find_map(|p| p.source_info.root_file_id())
             }
-            SourceInfo::Generated { .. } => {
-                self.invocation_anchor().and_then(|si| si.root_file_id())
-            }
+            SourceInfo::Generated(..) => self.invocation_anchor().and_then(|si| si.root_file_id()),
         }
     }
 
@@ -575,8 +609,8 @@ impl SourceInfo {
                     piece.source_info.collect_file_ids(out);
                 }
             }
-            SourceInfo::Generated { from, .. } => {
-                for anchor in from {
+            SourceInfo::Generated(g) => {
+                for anchor in &g.from {
                     anchor.source_info.collect_file_ids(out);
                 }
             }
@@ -959,7 +993,8 @@ mod tests {
         let mut info = SourceInfo::generated(By::filter("foo.lua", 42));
         info.remap_file_ids(&|_| FileId(99));
         match info {
-            SourceInfo::Generated { by, from } => {
+            SourceInfo::Generated(g) => {
+                let Generated { by, from } = *g;
                 assert!(from.is_empty());
                 let (path, line) = by.as_filter().unwrap();
                 assert_eq!(path, "foo.lua");
@@ -1126,7 +1161,8 @@ mod tests {
     fn test_source_info_for_test() {
         let si = SourceInfo::for_test();
         match si {
-            SourceInfo::Generated { by, from } => {
+            SourceInfo::Generated(g) => {
+                let Generated { by, from } = *g;
                 assert_eq!(by.kind, "test-scaffold");
                 assert!(from.is_empty());
             }
@@ -1259,7 +1295,8 @@ mod tests {
         );
         info.remap_file_ids(&|id| FileId(id.0 + 10));
         match &info {
-            SourceInfo::Generated { from, .. } => {
+            SourceInfo::Generated(g) => {
+                let from = &g.from;
                 assert_eq!(from.len(), 2);
                 match from[0].source_info.as_ref() {
                     SourceInfo::Original { file_id, .. } => assert_eq!(*file_id, FileId(10)),
@@ -1426,7 +1463,8 @@ mod tests {
             Arc::new(SourceInfo::original(FileId(2), 0, 1)),
         );
         match info {
-            SourceInfo::Generated { from, .. } => {
+            SourceInfo::Generated(g) => {
+                let from = &g.from;
                 assert_eq!(from.len(), 2);
                 assert!(matches!(from[0].role, AnchorRole::Invocation));
                 assert!(matches!(from[1].role, AnchorRole::ValueSource));
@@ -2149,5 +2187,105 @@ mod tests {
 
         assert_eq!(info.preimage_in(FileId(0)), Some(50..70));
         assert_eq!(info.preimage_in(FileId(1)), None);
+    }
+
+    // -------------------------------------------------------------------------
+    // Layout and wire-shape pins (qsm-g8ht9dod)
+    // -------------------------------------------------------------------------
+
+    /// Every AST node downstream carries at least one `SourceInfo`, so its
+    /// size is a first-order term in tree-walk cost. `Generated`'s payload is
+    /// boxed so the three common variants don't pay for it; the enum floor is
+    /// `Original` (24 bytes) plus the tag, and `Option` fits in the tag niche.
+    #[test]
+    fn test_source_info_is_32_bytes() {
+        use std::mem::size_of;
+        assert_eq!(size_of::<SourceInfo>(), 32);
+        assert_eq!(size_of::<Option<SourceInfo>>(), 32);
+    }
+
+    /// The JSON encoding of `Generated` is consumed across crate boundaries
+    /// (q2's pampa JSON reader/writer snapshots). These literals were
+    /// captured from 0.1.4, before the payload was boxed; they must never
+    /// change without a coordinated wire-format bump.
+    #[test]
+    fn test_generated_wire_shape_is_pinned() {
+        fn roundtrip(si: &SourceInfo, expected: &str) {
+            let json = serde_json::to_string(si).unwrap();
+            assert_eq!(json, expected);
+            let back: SourceInfo = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, si);
+        }
+
+        roundtrip(
+            &SourceInfo::generated(By::sectionize()),
+            r#"{"Generated":{"by":{"kind":"sectionize"}}}"#,
+        );
+        roundtrip(
+            &SourceInfo::for_test(),
+            r#"{"Generated":{"by":{"kind":"test-scaffold"}}}"#,
+        );
+
+        let mut full = SourceInfo::generated(By::shortcode("meta"));
+        full.append_anchor(
+            AnchorRole::Invocation,
+            Arc::new(SourceInfo::original(FileId(0), 3, 17)),
+        );
+        full.append_anchor(
+            AnchorRole::Other("ext/x/role".to_string()),
+            Arc::new(SourceInfo::original(FileId(1), 0, 2)),
+        );
+        roundtrip(
+            &full,
+            concat!(
+                r#"{"Generated":{"by":{"kind":"shortcode","data":{"name":"meta"}},"#,
+                r#""from":[{"role":"Invocation","source_info":{"Original":{"file_id":0,"start_offset":3,"end_offset":17}}},"#,
+                r#"{"role":{"Other":"ext/x/role"},"source_info":{"Original":{"file_id":1,"start_offset":0,"end_offset":2}}}]}}"#,
+            ),
+        );
+
+        // A missing `from` on the wire deserializes as an empty anchor list.
+        let sparse: SourceInfo =
+            serde_json::from_str(r#"{"Generated":{"by":{"kind":"sectionize"}}}"#).unwrap();
+        assert!(sparse.invocation_anchor().is_none());
+        assert_eq!(sparse, SourceInfo::generated(By::sectionize()));
+    }
+
+    #[test]
+    fn test_generated_with_and_as_generated() {
+        let anchor = Anchor {
+            role: AnchorRole::Invocation,
+            source_info: Arc::new(SourceInfo::original(FileId(0), 3, 17)),
+        };
+        // `generated_with` accepts a `Vec` or a `smallvec!`.
+        let from_vec = SourceInfo::generated_with(By::shortcode("meta"), vec![anchor.clone()]);
+        let from_sv =
+            SourceInfo::generated_with(By::shortcode("meta"), smallvec::smallvec![anchor]);
+        assert_eq!(from_vec, from_sv);
+        assert_eq!(from_vec.resolve_byte_range(), Some((0, 3, 17)));
+
+        let g = from_vec.as_generated().expect("Generated");
+        assert_eq!(g.by.kind, "shortcode");
+        assert_eq!(g.from.len(), 1);
+        assert!(
+            SourceInfo::original(FileId(0), 0, 1)
+                .as_generated()
+                .is_none()
+        );
+
+        // `generated(by)` is `generated_with(by, [])`.
+        assert_eq!(
+            SourceInfo::generated(By::sectionize()),
+            SourceInfo::generated_with(By::sectionize(), Vec::new())
+        );
+
+        let mut si = SourceInfo::generated(By::sectionize());
+        si.as_generated_mut().unwrap().by = By::appendix();
+        assert_eq!(si.as_generated().unwrap().by.kind, "appendix");
+        assert!(
+            SourceInfo::original(FileId(0), 0, 1)
+                .as_generated_mut()
+                .is_none()
+        );
     }
 }
