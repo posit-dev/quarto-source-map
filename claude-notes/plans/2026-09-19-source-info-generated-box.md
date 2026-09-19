@@ -188,20 +188,21 @@ syntax.
 
 ### Phase 2 — verify against q2 before publishing (tracked in q2's plan)
 
-- [ ] q2 builds this branch via an uncommitted `[patch.crates-io]` path
+- [x] q2 builds this branch via an uncommitted `[patch.crates-io]` path
       override at `external-sources/quarto-source-map`; migrate its sites;
       `cargo nextest run --workspace` and `cargo xtask verify`; **no JSON
       `.snap` file changes** (that is the wire-compatibility check on the
-      pampa side).
+      pampa side). Verified by the q2 agent before merge (2026-09-19).
 - [ ] q2 records `hyperfine` before/after on the release-perf build in its
       plan. Copy the headline numbers into this file once measured.
-- [ ] Any API gap q2's migration surfaces (e.g. a missing accessor) comes
-      back into Phase 1 before the version-bump PR merges.
+- [x] Any API gap q2's migration surfaces (e.g. a missing accessor) comes
+      back into Phase 1 before the version-bump PR merges. None surfaced.
 
 ### Phase 3 — release and cutover
 
-- [ ] Merge the 0.2.0 PR; confirm the release workflow published and tagged
-      `v0.2.0`.
+- [x] Merge the 0.2.0 PR; confirm the release workflow published and tagged
+      `v0.2.0`. Merged as ae0f8cd; release run succeeded; `v0.2.0` tagged
+      and 0.2.0 on crates.io (verified 2026-09-19).
 - [ ] `quarto-error-reporting`: bump dep to `0.2`, release 0.2.3.
 - [ ] `quarto-yaml`: bump dep to `0.2`, release 0.1.4.
 - [ ] q2: bump all three, `cargo tree -d` shows a single
