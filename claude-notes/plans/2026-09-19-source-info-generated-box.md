@@ -181,8 +181,10 @@ syntax.
       `cargo test --locked`, `cargo clippy --all-targets`, `cargo fmt`
       (128 unit + 1 integration + 4 doctests, 2026-09-19). Also added
       `test_generated_with_and_as_generated` for the new API.
-- [ ] Bump `Cargo.toml` to 0.2.0; open a PR on a branch (Carlos reviews,
+- [x] Bump `Cargo.toml` to 0.2.0; open a PR on a branch (Carlos reviews,
       merges; CI publishes on merge). PR description carries the changelog.
+      → PR #7 (branch `generated-box`), opened 2026-09-19. Merge is held
+      until Phase 2 verifies q2 against the branch.
 
 ### Phase 2 — verify against q2 before publishing (tracked in q2's plan)
 
