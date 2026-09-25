@@ -38,6 +38,10 @@ pub struct SourceFile {
 pub struct FileMetadata {
     /// File type (qmd, yaml, md, etc.)
     pub file_type: Option<String>,
+    /// Structured provenance for a *virtual* file — content extracted
+    /// from another file (e.g. a notebook cell). `None` for real files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::file_origin::FileOrigin>,
 }
 
 impl SourceContext {
@@ -79,7 +83,10 @@ impl SourceContext {
             path,
             content: stored_content,
             file_info,
-            metadata: FileMetadata { file_type: None },
+            metadata: FileMetadata {
+                file_type: None,
+                origin: None,
+            },
         });
         id
     }
@@ -98,7 +105,10 @@ impl SourceContext {
             path,
             content: None,
             file_info: Some(file_info),
-            metadata: FileMetadata { file_type: None },
+            metadata: FileMetadata {
+                file_type: None,
+                origin: None,
+            },
         });
         id
     }
@@ -142,7 +152,10 @@ impl SourceContext {
             path,
             content: stored_content,
             file_info,
-            metadata: FileMetadata { file_type: None },
+            metadata: FileMetadata {
+                file_type: None,
+                origin: None,
+            },
         });
 
         // Store mapping from FileId to index
@@ -160,6 +173,15 @@ impl SourceContext {
 
         // Otherwise use direct indexing (for sequential IDs from add_file)
         self.files.get(id.0)
+    }
+
+    /// Get a file by ID for mutation — typically to attach
+    /// [`FileMetadata::origin`] after registering a virtual file.
+    pub fn get_file_mut(&mut self, id: FileId) -> Option<&mut SourceFile> {
+        if let Some(&index) = self.file_id_map.get(&id.0) {
+            return self.files.get_mut(index);
+        }
+        self.files.get_mut(id.0)
     }
 
     /// Create a copy without FileInformation (for serialization)
@@ -286,5 +308,62 @@ mod tests {
 
         // Verify that None file_info is skipped in serialization
         assert!(!json.contains("\"file_info\""));
+    }
+
+    fn notebook_origin() -> crate::file_origin::FileOrigin {
+        crate::file_origin::FileOrigin::NotebookCell {
+            notebook_path: "notebook.ipynb".into(),
+            cell_index: 3,
+            cell_id: Some("cell-abc".into()),
+            cell_type: "code".into(),
+        }
+    }
+
+    #[test]
+    fn get_file_mut_attaches_origin_to_a_mapped_id() {
+        // add_file_with_id registers via file_id_map; the mutable accessor
+        // must resolve through the same mapping get_file uses.
+        let mut ctx = SourceContext::new();
+        let id = ctx.add_file_with_id(
+            FileId(9),
+            "notebook.ipynb[cell 3, code]".to_string(),
+            Some("print(1)\n".to_string()),
+        );
+        ctx.get_file_mut(id).unwrap().metadata.origin = Some(notebook_origin());
+
+        let file = ctx.get_file(FileId(9)).unwrap();
+        assert_eq!(file.metadata.origin, Some(notebook_origin()));
+    }
+
+    #[test]
+    fn origin_survives_without_content_and_serialization_round_trip() {
+        let mut ctx = SourceContext::new();
+        let id = ctx.add_file("cell.qmd".to_string(), Some("x".to_string()));
+        ctx.get_file_mut(id).unwrap().metadata.origin = Some(notebook_origin());
+
+        let json = serde_json::to_string(&ctx.without_content()).unwrap();
+        assert!(json.contains("\"origin\""), "origin must serialize: {json}");
+        let back: SourceContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.get_file(id).unwrap().metadata.origin,
+            Some(notebook_origin())
+        );
+    }
+
+    #[test]
+    fn origin_is_omitted_and_defaults_to_none() {
+        let mut ctx = SourceContext::new();
+        ctx.add_file("real.qmd".to_string(), Some("x".to_string()));
+
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(
+            !json.contains("\"origin\""),
+            "None origin must be omitted from the wire shape: {json}"
+        );
+        // Old JSON (written before the field existed) must deserialize.
+        let back: SourceContext =
+            serde_json::from_str(r#"{"files":[{"path":"old.qmd","metadata":{"file_type":null}}]}"#)
+                .unwrap();
+        assert_eq!(back.get_file(FileId(0)).unwrap().metadata.origin, None);
     }
 }
