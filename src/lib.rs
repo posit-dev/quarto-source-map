@@ -32,6 +32,7 @@
 
 pub mod context;
 pub mod file_info;
+pub mod file_origin;
 pub mod mapping;
 pub mod provenance_builder;
 pub mod source_info;
@@ -41,6 +42,7 @@ pub mod utils;
 // Re-export main types
 pub use context::{FileMetadata, SourceContext, SourceFile};
 pub use file_info::FileInformation;
+pub use file_origin::FileOrigin;
 pub use mapping::MappedLocation;
 pub use provenance_builder::ProvenanceBuilder;
 pub use source_info::{Anchor, AnchorRole, By, Generated, SourceInfo, SourcePiece};
