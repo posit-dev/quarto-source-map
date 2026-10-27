@@ -150,6 +150,18 @@ pub struct SourcePiece {
     pub length: usize,
 }
 
+/// One contiguous byte run in one source file.
+///
+/// Produced by [`SourceInfo::resolved_runs`]. `start..end` are byte
+/// offsets in `file_id`; `start == end` is a zero-length run (an empty
+/// location, or a synthesized piece anchored at a position).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SourceRun {
+    pub file_id: FileId,
+    pub start: usize,
+    pub end: usize,
+}
+
 impl Default for SourceInfo {
     fn default() -> Self {
         SourceInfo::Original {
@@ -420,7 +432,10 @@ impl SourceInfo {
     /// `Invocation` anchor is present). The attribution v1 sidecar
     /// relies on this contract; project-scoped (v2) features that need
     /// the full chain resolver should use `map_offset` against a
-    /// `SourceContext` instead.
+    /// `SourceContext` instead. Consumers that need the runs of *any*
+    /// shape (a `Concat`'s pieces, a `Substring` over a `Concat`) use
+    /// [`resolved_runs`](Self::resolved_runs), which relaxes the
+    /// single-range contract rather than this one.
     pub fn resolve_byte_range(&self) -> Option<(usize, usize, usize)> {
         match self {
             SourceInfo::Original {
@@ -489,6 +504,11 @@ impl SourceInfo {
     /// attribution metadata is not accidentally consulted by the writer's
     /// byte-copying path. If a role *does* contribute to body-text preimage,
     /// it must be explicitly added to this function's `Generated` arm.
+    ///
+    /// For locating (not copying) through a `Substring` over a `Concat`,
+    /// or through a gappy `Concat`, see
+    /// [`resolved_runs`](Self::resolved_runs), which returns every run
+    /// instead of refusing.
     pub fn preimage_in(&self, target: FileId) -> Option<std::ops::Range<usize>> {
         match self {
             SourceInfo::Original {
@@ -536,6 +556,157 @@ impl SourceInfo {
             SourceInfo::Generated(..) => self
                 .invocation_anchor()
                 .and_then(|si| si.preimage_in(target)),
+        }
+    }
+
+    /// Ordered source runs that this location's content maps onto.
+    ///
+    /// Where [`resolve_byte_range`](Self::resolve_byte_range) demands a
+    /// single contiguous range and [`preimage_in`](Self::preimage_in)
+    /// demands a contiguous hull in one file, this accessor describes any
+    /// shape: a `Concat` expands to one run per piece, and a `Substring`
+    /// over a `Concat` is sliced across the pieces it covers. Adjacent
+    /// runs in the same file are merged, so a `Concat` whose pieces tile
+    /// the source contiguously yields the same runs as the equivalent
+    /// `Original`. Runs come in content order, which for a cross-file
+    /// `Concat` (notebook cells) interleaves files; runs from different
+    /// files are never merged.
+    ///
+    /// Semantics by variant:
+    /// - `Original` → one run, affine and unclamped like
+    ///   `resolve_byte_range`.
+    /// - `Substring` → the parent's runs restricted to the substring's
+    ///   content range; offsets compose additively through chains.
+    /// - `Concat` → every covered piece contributes a run. A piece covered
+    ///   to its content end contributes up to its *source* end
+    ///   (`piece.source_info.length()`, the exclusive-end rule of
+    ///   `map_offset`), so a fully covered replacement piece (a decoded
+    ///   escape, a folded newline) yields its whole source run. An offset
+    ///   strictly inside a piece composes affinely, clamped to the piece's
+    ///   source length: exact for verbatim pieces, and for a partially
+    ///   covered replacement piece the same approximation `map_offset`
+    ///   makes. A zero-content piece (a deletion) contributes its source
+    ///   run when it lies strictly inside the range, and nothing at the
+    ///   range's edges, where `map_offset` also skips it.
+    /// - `Generated` → the first `Invocation` anchor's runs, or `None`
+    ///   without one, mirroring `resolve_byte_range`.
+    ///
+    /// An empty location (`length() == 0`) yields one zero-length run at
+    /// the position `map_offset(0)` would report.
+    ///
+    /// Like `preimage_in`'s hull, the result is an **offset claim, not a
+    /// byte-identity claim**: it licenses locating a position in the
+    /// source (rendering a caret, grouping diagnostics by what they point
+    /// at), never copying bytes from it. A replacement piece's run holds
+    /// bytes that differ from the content it produced.
+    ///
+    /// Returns `None` when no run can be computed: a `Generated` without an
+    /// `Invocation` anchor on the path, or a non-empty range that falls
+    /// outside every piece of a `Concat`.
+    pub fn resolved_runs(&self) -> Option<Vec<SourceRun>> {
+        let mut runs = Vec::new();
+        match self {
+            // A Generated node has no content of its own (length 0); its
+            // runs are its anchor's, in full — the same delegation as
+            // `resolve_byte_range`.
+            SourceInfo::Generated(..) => return self.invocation_anchor()?.resolved_runs(),
+            _ => self.collect_runs(0, self.length(), &mut runs)?,
+        }
+        let mut merged: Vec<SourceRun> = Vec::with_capacity(runs.len());
+        for run in runs {
+            if let Some(last) = merged.last_mut()
+                && last.file_id == run.file_id
+                && last.end == run.start
+            {
+                last.end = run.end;
+            } else {
+                merged.push(run);
+            }
+        }
+        if merged.is_empty() {
+            None
+        } else {
+            Some(merged)
+        }
+    }
+
+    /// Append the runs for `[start, end)` of this node's content to
+    /// `out`. See [`resolved_runs`](Self::resolved_runs) for the contract.
+    fn collect_runs(&self, start: usize, end: usize, out: &mut Vec<SourceRun>) -> Option<()> {
+        match self {
+            SourceInfo::Original {
+                file_id,
+                start_offset,
+                ..
+            } => {
+                out.push(SourceRun {
+                    file_id: *file_id,
+                    start: start_offset + start,
+                    end: start_offset + end,
+                });
+                Some(())
+            }
+            SourceInfo::Substring {
+                parent,
+                start_offset,
+                ..
+            } => parent.collect_runs(start_offset + start, start_offset + end, out),
+            SourceInfo::Concat { pieces } => {
+                if start == end {
+                    // Empty range: one zero-length run where
+                    // `map_offset(start)` points — the piece containing
+                    // `start`, or the source end of the last piece for the
+                    // exclusive end.
+                    let piece = pieces
+                        .iter()
+                        .find(|p| {
+                            start >= p.offset_in_concat && start < p.offset_in_concat + p.length
+                        })
+                        .or_else(|| {
+                            pieces
+                                .last()
+                                .filter(|p| start == p.offset_in_concat + p.length)
+                        })?;
+                    let src_len = piece.source_info.length();
+                    let off = if start == piece.offset_in_concat + piece.length {
+                        src_len
+                    } else {
+                        (start - piece.offset_in_concat).min(src_len)
+                    };
+                    return piece.source_info.collect_runs(off, off, out);
+                }
+                let mut any = false;
+                for piece in pieces {
+                    let p0 = piece.offset_in_concat;
+                    let p1 = p0 + piece.length;
+                    let src_len = piece.source_info.length();
+                    if piece.length == 0 {
+                        // A deletion: its source bytes sit between two
+                        // content bytes. Include them only when the range
+                        // crosses that seam.
+                        if start < p0 && p0 < end {
+                            any = true;
+                            piece.source_info.collect_runs(0, src_len, out)?;
+                        }
+                        continue;
+                    }
+                    let lo = start.max(p0);
+                    let hi = end.min(p1);
+                    if lo >= hi {
+                        continue;
+                    }
+                    any = true;
+                    let from = if lo == p0 { 0 } else { (lo - p0).min(src_len) };
+                    let to = if hi == p1 {
+                        src_len
+                    } else {
+                        (hi - p0).min(src_len)
+                    };
+                    piece.source_info.collect_runs(from, to, out)?;
+                }
+                any.then_some(())
+            }
+            SourceInfo::Generated(..) => self.invocation_anchor()?.collect_runs(start, end, out),
         }
     }
 
@@ -2286,6 +2457,282 @@ mod tests {
             SourceInfo::original(FileId(0), 0, 1)
                 .as_generated_mut()
                 .is_none()
+        );
+    }
+
+    // ==================== resolved_runs ====================
+
+    fn run(file: usize, start: usize, end: usize) -> SourceRun {
+        SourceRun {
+            file_id: FileId(file),
+            start,
+            end,
+        }
+    }
+
+    /// Two same-file pieces with a source gap between them: content
+    /// "AAA" from 0..3 and "BBB" from 10..13.
+    fn gapped_concat() -> SourceInfo {
+        SourceInfo::concat(vec![
+            (SourceInfo::original(FileId(1), 0, 3), 3),
+            (SourceInfo::original(FileId(1), 10, 13), 3),
+        ])
+    }
+
+    /// Verbatim 0..3, a 4-byte→1-byte replacement at 3..7, verbatim
+    /// 7..10: the shape of a folded scalar (newline + indent → space) or
+    /// a decoded escape. Content is 7 bytes over 10 source bytes.
+    fn replacement_concat() -> SourceInfo {
+        SourceInfo::concat(vec![
+            (SourceInfo::original(FileId(1), 0, 3), 3),
+            (SourceInfo::original(FileId(1), 3, 7), 1),
+            (SourceInfo::original(FileId(1), 7, 10), 3),
+        ])
+    }
+
+    #[test]
+    fn resolved_runs_original_is_one_run() {
+        let si = SourceInfo::original(FileId(1), 5, 9);
+        assert_eq!(si.resolved_runs(), Some(vec![run(1, 5, 9)]));
+    }
+
+    #[test]
+    fn resolved_runs_substring_chain_composes() {
+        let root = SourceInfo::original(FileId(1), 100, 200);
+        let mid = SourceInfo::substring(root, 10, 50);
+        let leaf = SourceInfo::substring(mid, 5, 15);
+        assert_eq!(leaf.resolved_runs(), Some(vec![run(1, 115, 125)]));
+        // Agrees with resolve_byte_range where that accessor works.
+        assert_eq!(leaf.resolve_byte_range(), Some((1, 115, 125)));
+    }
+
+    #[test]
+    fn resolved_runs_gapped_concat_is_two_runs() {
+        assert_eq!(
+            gapped_concat().resolved_runs(),
+            Some(vec![run(1, 0, 3), run(1, 10, 13)])
+        );
+    }
+
+    #[test]
+    fn resolved_runs_tiled_concat_merges_to_the_original_runs() {
+        let tiled = SourceInfo::concat(vec![
+            (SourceInfo::original(FileId(1), 0, 3), 3),
+            (SourceInfo::original(FileId(1), 3, 6), 3),
+        ]);
+        assert_eq!(
+            tiled.resolved_runs(),
+            SourceInfo::original(FileId(1), 0, 6).resolved_runs()
+        );
+        let one_piece = SourceInfo::concat(vec![(SourceInfo::original(FileId(1), 0, 6), 6)]);
+        assert_eq!(one_piece.resolved_runs(), Some(vec![run(1, 0, 6)]));
+    }
+
+    #[test]
+    fn resolved_runs_replacement_pieces_merge_into_the_scalar_span() {
+        // A folded scalar's pieces tile the source contiguously (the
+        // ProvenanceBuilder invariant), so the whole scalar is one run
+        // even though its content is shorter than its source.
+        assert_eq!(
+            replacement_concat().resolved_runs(),
+            Some(vec![run(1, 0, 10)])
+        );
+    }
+
+    #[test]
+    fn resolved_runs_substring_over_concat_inside_one_piece() {
+        let sub = SourceInfo::substring(gapped_concat(), 4, 6);
+        assert_eq!(sub.resolved_runs(), Some(vec![run(1, 11, 13)]));
+        // The accessors that need a contiguous range still refuse this
+        // shape; resolved_runs is the one that serves it.
+        assert_eq!(sub.resolve_byte_range(), None);
+        assert_eq!(sub.preimage_in(FileId(1)), None);
+    }
+
+    #[test]
+    fn resolved_runs_substring_over_concat_spanning_pieces() {
+        let sub = SourceInfo::substring(gapped_concat(), 1, 5);
+        assert_eq!(
+            sub.resolved_runs(),
+            Some(vec![run(1, 1, 3), run(1, 10, 12)])
+        );
+    }
+
+    #[test]
+    fn resolved_runs_fully_covered_replacement_piece_yields_its_whole_source_run() {
+        let parent = replacement_concat();
+        // Just the replacement piece: content 3..4 is source 3..7.
+        assert_eq!(
+            SourceInfo::substring(parent.clone(), 3, 4).resolved_runs(),
+            Some(vec![run(1, 3, 7)])
+        );
+        // Verbatim + replacement: 0..4 → 0..7, merged.
+        assert_eq!(
+            SourceInfo::substring(parent.clone(), 0, 4).resolved_runs(),
+            Some(vec![run(1, 0, 7)])
+        );
+        // Replacement + trailing verbatim: 3..7 → 3..10.
+        assert_eq!(
+            SourceInfo::substring(parent, 3, 7).resolved_runs(),
+            Some(vec![run(1, 3, 10)])
+        );
+    }
+
+    #[test]
+    fn resolved_runs_partially_covered_replacement_piece_is_affine_and_clamped() {
+        // A 2-byte source run producing 3 content bytes (content 3..6 →
+        // source 3..5), followed by verbatim content 6..9 → source 5..8.
+        let parent = SourceInfo::concat(vec![
+            (SourceInfo::original(FileId(1), 0, 3), 3),
+            (SourceInfo::original(FileId(1), 3, 5), 3),
+            (SourceInfo::original(FileId(1), 5, 8), 3),
+        ]);
+        // One content byte into the replacement composes affinely: 3..4.
+        assert_eq!(
+            SourceInfo::substring(parent.clone(), 0, 4).resolved_runs(),
+            Some(vec![run(1, 0, 4)])
+        );
+        // Three content bytes in is clamped to the 2-byte source run.
+        assert_eq!(
+            SourceInfo::substring(parent.clone(), 0, 6).resolved_runs(),
+            Some(vec![run(1, 0, 5)])
+        );
+        // Starting inside the replacement: content 5 is clamped to the
+        // piece's source end, giving a zero-length head that merges
+        // with the verbatim tail.
+        assert_eq!(
+            SourceInfo::substring(parent, 5, 9).resolved_runs(),
+            Some(vec![run(1, 5, 8)])
+        );
+    }
+
+    #[test]
+    fn resolved_runs_cross_file_concat_never_merges_across_files() {
+        let cells = SourceInfo::concat(vec![
+            (SourceInfo::original(FileId(1), 0, 3), 3),
+            (SourceInfo::original(FileId(2), 3, 6), 3),
+        ]);
+        assert_eq!(
+            cells.resolved_runs(),
+            Some(vec![run(1, 0, 3), run(2, 3, 6)])
+        );
+    }
+
+    #[test]
+    fn resolved_runs_empty_range_is_a_zero_length_run_where_map_offset_points() {
+        let parent = gapped_concat();
+        // Content 3 is the first byte of the second piece.
+        assert_eq!(
+            SourceInfo::substring(parent.clone(), 3, 3).resolved_runs(),
+            Some(vec![run(1, 10, 10)])
+        );
+        // Interior of the first piece.
+        assert_eq!(
+            SourceInfo::substring(parent.clone(), 1, 1).resolved_runs(),
+            Some(vec![run(1, 1, 1)])
+        );
+        // Exclusive end: the source end of the last piece.
+        assert_eq!(
+            SourceInfo::substring(parent.clone(), 6, 6).resolved_runs(),
+            Some(vec![run(1, 13, 13)])
+        );
+        // Beyond the content: nothing to point at.
+        assert_eq!(SourceInfo::substring(parent, 7, 7).resolved_runs(), None);
+        // An empty Original is its own zero-length run.
+        assert_eq!(
+            SourceInfo::original(FileId(1), 4, 4).resolved_runs(),
+            Some(vec![run(1, 4, 4)])
+        );
+    }
+
+    #[test]
+    fn resolved_runs_non_empty_range_outside_every_piece_is_none() {
+        assert_eq!(
+            SourceInfo::substring(gapped_concat(), 10, 12).resolved_runs(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolved_runs_deletion_piece_counts_only_strictly_inside_the_range() {
+        // Verbatim 0..3, a deletion of source 3..5 (zero content), verbatim
+        // 5..8. Content is 6 bytes over 8 source bytes.
+        let parent = SourceInfo::concat(vec![
+            (SourceInfo::original(FileId(1), 0, 3), 3),
+            (SourceInfo::original(FileId(1), 3, 5), 0),
+            (SourceInfo::original(FileId(1), 5, 8), 3),
+        ]);
+        // Crossing the seam picks up the deleted bytes, so the whole
+        // thing is one run.
+        assert_eq!(parent.resolved_runs(), Some(vec![run(1, 0, 8)]));
+        assert_eq!(
+            SourceInfo::substring(parent.clone(), 2, 4).resolved_runs(),
+            Some(vec![run(1, 2, 6)])
+        );
+        // Ending or starting at the seam does not, matching map_offset.
+        assert_eq!(
+            SourceInfo::substring(parent.clone(), 0, 3).resolved_runs(),
+            Some(vec![run(1, 0, 3)])
+        );
+        assert_eq!(
+            SourceInfo::substring(parent, 3, 6).resolved_runs(),
+            Some(vec![run(1, 5, 8)])
+        );
+    }
+
+    #[test]
+    fn resolved_runs_generated_follows_the_invocation_anchor() {
+        let anchor = SourceInfo::original(FileId(2), 10, 20);
+        let with = SourceInfo::generated_with(
+            By::shortcode("meta"),
+            vec![Anchor::invocation(Arc::new(anchor.clone()))],
+        );
+        assert_eq!(with.resolved_runs(), Some(vec![run(2, 10, 20)]));
+        assert_eq!(with.resolve_byte_range(), Some((2, 10, 20)));
+
+        // A ValueSource anchor is not consulted (role asymmetry, as in
+        // resolve_byte_range / preimage_in).
+        let value_only = SourceInfo::generated_with(
+            By::shortcode("meta"),
+            vec![Anchor::value_source(Arc::new(anchor))],
+        );
+        assert_eq!(value_only.resolved_runs(), None);
+        assert_eq!(
+            SourceInfo::generated(By::sectionize()).resolved_runs(),
+            None
+        );
+
+        // A Substring over a Generated composes onto the anchor, as
+        // resolve_byte_range does.
+        let sub = SourceInfo::substring(with, 2, 5);
+        assert_eq!(sub.resolved_runs(), Some(vec![run(2, 12, 15)]));
+        assert_eq!(sub.resolve_byte_range(), Some((2, 12, 15)));
+    }
+
+    #[test]
+    fn resolved_runs_provenance_builder_over_a_concat_parent_round_trips() {
+        // quarto-yaml's shape for a scalar inside a multi-piece parent
+        // (q2's per-cell ipynb virtual files): the parent is a cross-file
+        // Concat, and the builder's pieces are Substrings over it.
+        let parent = SourceInfo::concat(vec![
+            (SourceInfo::original(FileId(1), 0, 10), 10),
+            (SourceInfo::original(FileId(2), 0, 10), 10),
+        ]);
+        let mut b = crate::ProvenanceBuilder::in_parent(parent, 2);
+        b.verbatim(2..8);
+        b.replacement(8..12, 1);
+        b.verbatim(12..15);
+        let si = b.finish();
+        assert!(matches!(si, SourceInfo::Concat { .. }));
+        // 2..8 → file 1 2..8; 8..12 → file 1 8..10 + file 2 0..2;
+        // 12..15 → file 2 2..5. Same-file neighbours merge.
+        assert_eq!(si.resolved_runs(), Some(vec![run(1, 2, 10), run(2, 0, 5)]));
+        // A diagnostic re-parsed out of that scalar is a Substring over
+        // it: content 5..9 (one byte before the replacement, the
+        // replacement itself, and the first two bytes after).
+        assert_eq!(
+            SourceInfo::substring(si, 5, 9).resolved_runs(),
+            Some(vec![run(1, 7, 10), run(2, 0, 4)])
         );
     }
 }
