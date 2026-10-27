@@ -47,6 +47,6 @@ length semantics live, instead of re-deriving them in the consumer.
 - [x] Doc cross-references from `resolve_byte_range` and `preimage_in`.
 - [x] `cargo fmt --check`, `cargo clippy --all-targets --locked -D
       warnings`, `cargo test --locked` green.
-- [ ] Version bump to 0.3.1 (separate commit at the tip of the PR).
+- [x] Version bump to 0.3.1 (separate commit at the tip of the PR).
 - [ ] PR opened; cross-linked to the quarto-error-reporting PR.
 - [ ] Merged and published (user go-ahead required).
